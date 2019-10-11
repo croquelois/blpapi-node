@@ -55,12 +55,12 @@
 
 #define BLPAPI_EXCEPTION_NEW(type)                                          \
     Local<Object> err =                                                     \
-        Exception::Error(NEW_STRING(e.description().c_str()))->ToObject();  \
+        Exception::Error(NEW_STRING(e.description().c_str()))->ToObject(args.GetIsolate()->GetCurrentContext()).ToLocalChecked();  \
     err->Set(NEW_STRING("typeName"), NEW_STRING(#type));
 
 #define BLPAPI_EXCEPTION_THROW(prefix, type)                                \
     BLPAPI_EXCEPTION_NEW(type)                                              \
-    prefix##RetThrowException(err);
+    prefix##ThrowException(err);
 
 #define BLPAPI_EXCEPTION_CATCH_BLOCK(prefix, type)                          \
     } catch (const blpapi::type& e) {                                       \
@@ -80,9 +80,9 @@
 
 
 #define BLPAPI_EXCEPTION_CATCH                                              \
-    BLPAPI_EXCEPTION_IMPL(No)
+    BLPAPI_EXCEPTION_IMPL(NoRet)
 #define BLPAPI_EXCEPTION_CATCH_RETURN                                       \
-    BLPAPI_EXCEPTION_IMPL()
+    BLPAPI_EXCEPTION_IMPL(Ret)
 
 using namespace node;
 using namespace v8;
@@ -93,9 +93,9 @@ namespace blpapijs {
 namespace {
 
 static inline void
-mkdatetime(blpapi::Datetime* dt, Local<Value> val)
+mkdatetime(Local<Context> context,blpapi::Datetime* dt, Local<Value> val)
 {
-    double ms = Date::Cast(*val)->NumberValue();
+    double ms = Date::Cast(*val)->NumberValue(context).FromJust();
     time_t sec = static_cast<time_t>(ms / 1000.0);
     int remainder = static_cast<int>(fmod(ms, 1000.0));
 
@@ -120,26 +120,27 @@ void loadElement(blpapi::Element *elem, const T& value, bool forArray)
     }
 }
 
-int loadElement(blpapi::Element *elem,
+int loadElement(Isolate         *isolate,
+                Local<Context>   context,
+                blpapi::Element *elem,
                 Local<Value>     val,
                 bool             forArray,
                 std::string     *error)
 {
+  
     if (val->IsString()) {
-        loadElement(elem, *String::Utf8Value(val), forArray);
+        loadElement(elem, *String::Utf8Value(isolate, val), forArray);
     } else if (val->IsBoolean()) {
-        loadElement(elem, val->BooleanValue(), forArray);
+        loadElement(elem, val->BooleanValue(context).FromJust(), forArray);
     } else if (val->IsNumber()) {
-        loadElement(elem, val->NumberValue(), forArray);
+        loadElement(elem, val->NumberValue(context).FromJust(), forArray);
     } else if (val->IsInt32()) {
-        loadElement(elem, val->Int32Value(), forArray);
+        loadElement(elem, val->Int32Value(context).FromJust(), forArray);
     } else if (val->IsUint32()) {
-        loadElement(elem,
-                    static_cast<blpapi::Int64>(val->Uint32Value()),
-                    forArray);
+        loadElement(elem, static_cast<blpapi::Int64>(val->Uint32Value(context).FromJust()), forArray);
     } else if (val->IsDate()) {
         blpapi::Datetime dt;
-        mkdatetime(&dt, val);
+        mkdatetime(context, &dt, val);
         loadElement(elem, dt, forArray);
     } else if (val->IsArray()) {
         blpapi::Element subElem;
@@ -148,10 +149,10 @@ int loadElement(blpapi::Element *elem,
             elem = &subElem;
         }
 
-        Local<Object> subArray = val->ToObject();
+        Local<Object> subArray = val->ToObject(context).ToLocalChecked();
         const int subArrayLen = Array::Cast(*val)->Length();
         for (int i = 0; i < subArrayLen; ++i) {
-            if (loadElement(elem, subArray->Get(i), true, error)) {
+            if (loadElement(isolate, context, elem, subArray->Get(i), true, error)) {
                 return 1;
             }
         }
@@ -162,13 +163,13 @@ int loadElement(blpapi::Element *elem,
             elem = &subElem;
         }
 
-        Local<Object> obj = val->ToObject();
+        Local<Object> obj = val->ToObject(context).ToLocalChecked();
         Local<Array> props = obj->GetPropertyNames();
         for (std::size_t i = 0; i < props->Length(); ++i) {
             Local<Value> key = props->Get(i);
             String::Utf8Value keyStr(key);
             blpapi::Element elemValue = elem->getElement(*keyStr);
-            if (loadElement(&elemValue, obj->Get(key), false, error)) {
+            if (loadElement(isolate, context, &elemValue, obj->Get(key), false, error)) {
                 return 1;
             }
         }
@@ -185,12 +186,14 @@ int loadElement(blpapi::Element *elem,
 }
 
 inline
-int loadRequest(blpapi::Request *request,
+int loadRequest(Isolate         *isolate,
+                Local<Context>   context,
+                blpapi::Request *request,
                 Local<Value>     val,
                 std::string     *error)
 {
     blpapi::Element elem = request->asElement();
-    return loadElement(&elem, val->ToObject(), false, error);
+    return loadElement(isolate, context, &elem, val->ToObject(), false, error);
 }
 
 }  // close anonymous namespace
@@ -291,10 +294,10 @@ private:
 
     static void subscribe(const FunctionCallbackInfo<Value>& args,
                           int action);
-    static void formFields(std::string* str, Handle<Object> array);
-    static void formOptions(std::string* str, Handle<Value> array);
-    static Handle<Value> elementToValue(Isolate *, const blpapi::Element& e);
-    static Handle<Value> elementValueToValue(Isolate *,
+    static void formFields(Local<Context> context, std::string* str, Handle<Object> array);
+    static void formOptions(Local<Context> context, std::string* str, Handle<Value> array);
+    static Handle<Value> elementToValue(Isolate *, Local<Context> context, const blpapi::Element& e);
+    static Handle<Value> elementValueToValue(Isolate *, Local<Context> context,
                                              const blpapi::Element& e,
                                              int idx = 0);
 
@@ -304,6 +307,7 @@ private:
     bool processEvent(const blpapi::Event& ev, blpapi::Session* session);
     static void processEvents(uv_async_t *async);
     void processMessage(Isolate *isolate,
+                        Local<Context> context, 
                         blpapi::Event::EventType et,
                         const blpapi::Message& msg);
 
@@ -427,14 +431,16 @@ Session::Initialize(Handle<Object> target)
 void
 Session::New(const FunctionCallbackInfo<Value>& args)
 {
-    EscapableHandleScope scope(args.GetIsolate());
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
 
     std::string serverHost;
     int serverPort = 0;
     std::string authenticationOptions;
 
     if (args.Length() > 0 && args[0]->IsObject()) {
-        Local<Object> o = args[0]->ToObject();
+        Local<Object> o = args[0]->ToObject(context).ToLocalChecked();
 
         // Capture the host name
         Local<Value> h = o->Get(NEW_STRING("host"));
@@ -455,7 +461,7 @@ Session::New(const FunctionCallbackInfo<Value>& args)
         if (p->IsUndefined())
             p = o->Get(NEW_STRING("serverPort"));
         if (p->IsInt32())
-            serverPort = p->ToInt32()->Value();
+            serverPort = p->ToInt32(context).ToLocalChecked()->Value();
         if (0 == serverPort) {
             RetThrowException(Exception::Error(NEW_STRING(
                 "Configuration missing non-zero 'serverPort'.")));
@@ -514,7 +520,9 @@ Session::Start(const FunctionCallbackInfo<Value>& args)
 void
 Session::Authorize(const FunctionCallbackInfo<Value>& args)
 {
-    EscapableHandleScope scope(args.GetIsolate());
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
 
     if (args.Length() < 1 || !args[0]->IsString()) {
         RetThrowException(Exception::Error(NEW_STRING(
@@ -530,10 +538,10 @@ Session::Authorize(const FunctionCallbackInfo<Value>& args)
             "Function expects at most two arguments.")));
     }
 
-    Local<String> s = args[0]->ToString();
+    Local<String> s = args[0]->ToString(context).ToLocalChecked();
     String::Utf8Value uriv(s);
 
-    int cidi = args[1]->Int32Value();
+    int cidi = args[1]->Int32Value(context).FromJust();
 
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
@@ -594,7 +602,10 @@ Session::Authorize(const FunctionCallbackInfo<Value>& args)
 void
 Session::AuthorizeUser(const FunctionCallbackInfo<Value>& args)
 {
-    EscapableHandleScope scope(args.GetIsolate());
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
+    
     if (args.Length() < 1 || !args[0]->IsObject()) {
         RetThrowException(Exception::Error(NEW_STRING(
             "Object containing auth request parameters must be provided as "
@@ -610,7 +621,7 @@ Session::AuthorizeUser(const FunctionCallbackInfo<Value>& args)
             "Function expects at most two arguments.")));
     }
 
-    int cidi = args[1]->Int32Value();
+    int cidi = args[1]->Int32Value(context).FromJust();
 
     Session *session = ObjectWrap::Unwrap<Session>(args.This());
 
@@ -625,7 +636,7 @@ Session::AuthorizeUser(const FunctionCallbackInfo<Value>& args)
     blpapi::Request request(service.createAuthorizationRequest(
                                                       "AuthorizationRequest"));
     std::string error;
-    if (loadRequest(&request, args[0], &error)) {
+    if (loadRequest(isolate, context, &request, args[0], &error)) {
         RetThrowException(Exception::Error(NEW_STRING(error.c_str())));
     }
     blpapi::CorrelationId cid(cidi);
@@ -637,8 +648,7 @@ Session::AuthorizeUser(const FunctionCallbackInfo<Value>& args)
 
     BLPAPI_EXCEPTION_CATCH_RETURN
 
-    args.GetReturnValue().Set(scope.Escape(Integer::New(args.GetIsolate(),
-                                                        cidi)));
+    args.GetReturnValue().Set(scope.Escape(Integer::New(args.GetIsolate(),cidi)));
 }
 
 void
@@ -711,7 +721,9 @@ Session::Destroy(const FunctionCallbackInfo<Value>& args)
 void
 Session::OpenService(const FunctionCallbackInfo<Value>& args)
 {
-    EscapableHandleScope scope(args.GetIsolate());
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
 
     if (args.Length() < 1 || !args[0]->IsString()) {
         RetThrowException(Exception::Error(NEW_STRING(
@@ -727,10 +739,10 @@ Session::OpenService(const FunctionCallbackInfo<Value>& args)
             "Function expects at most two arguments.")));
     }
 
-    Local<String> s = args[0]->ToString();
+    Local<String> s = args[0]->ToString(context).ToLocalChecked();
     String::Utf8Value uriv(s);
 
-    int cidi = args[1]->Int32Value();
+    int cidi = args[1]->Int32Value(context).FromJust();
     blpapi::CorrelationId cid(cidi);
 
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
@@ -749,7 +761,7 @@ Session::OpenService(const FunctionCallbackInfo<Value>& args)
 }
 
 void
-Session::formFields(std::string* str, Handle<Object> object)
+Session::formFields(Local<Context> context, std::string* str, Handle<Object> object)
 {
     // Use the HandleScope of the calling function for speed.
 
@@ -759,7 +771,7 @@ Session::formFields(std::string* str, Handle<Object> object)
 
     // Format each array value into the options string "V[&V]"
     for (std::size_t i = 0; i < Array::Cast(*object)->Length(); ++i) {
-        Local<String> s = object->Get(i)->ToString();
+        Local<String> s = object->Get(i)->ToString(context).ToLocalChecked();
         String::Utf8Value v(s);
         if (v.length()) {
             if (i > 0)
@@ -772,7 +784,7 @@ Session::formFields(std::string* str, Handle<Object> object)
 }
 
 void
-Session::formOptions(std::string* str, Handle<Value> value)
+Session::formOptions(Local<Context> context, std::string* str, Handle<Value> value)
 {
     // Use the HandleScope of the calling function for speed.
 
@@ -785,9 +797,9 @@ Session::formOptions(std::string* str, Handle<Value> value)
 
     if (value->IsArray()) {
         // Format each array value into the options string "V[&V]"
-        Local<Object> object = value->ToObject();
+        Local<Object> object = value->ToObject(context).ToLocalChecked();
         for (std::size_t i = 0; i < Array::Cast(*object)->Length(); ++i) {
-            Local<String> key = object->Get(i)->ToString();
+            Local<String> key = object->Get(i)->ToString(context).ToLocalChecked();
             String::Utf8Value valv(key);
             if (valv.length()) {
                 if (i > 0)
@@ -797,10 +809,10 @@ Session::formOptions(std::string* str, Handle<Value> value)
         }
     } else {
         // Format each KV pair into the options string "K=V[&K=V]"
-        Local<Object> object = value->ToObject();
+        Local<Object> object = value->ToObject(context).ToLocalChecked();
         Local<Array> keys = object->GetPropertyNames();
         for (std::size_t i = 0; i < keys->Length(); ++i) {
-            Local<String> key = keys->Get(i)->ToString();
+            Local<String> key = keys->Get(i)->ToString(context).ToLocalChecked();
             String::Utf8Value keyv(key);
             if (keyv.length()) {
                 if (i > 0)
@@ -808,7 +820,7 @@ Session::formOptions(std::string* str, Handle<Value> value)
                 ss << *keyv << "=";
             }
 
-            Local<String> val = object->Get(key)->ToString();
+            Local<String> val = object->Get(key)->ToString(context).ToLocalChecked();
             String::Utf8Value valv(val);
             if (valv.length())
                 ss << *valv;
@@ -821,7 +833,9 @@ Session::formOptions(std::string* str, Handle<Value> value)
 void
 Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
 {
-    EscapableHandleScope scope(args.GetIsolate());
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
 
     if (args.Length() < 1 || !args[0]->IsArray()) {
         RetThrowException(Exception::Error(NEW_STRING(
@@ -844,7 +858,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
 
     blpapi::SubscriptionList sl;
 
-    Local<Object> o = args[0]->ToObject();
+    Local<Object> o = args[0]->ToObject(context).ToLocalChecked();
     for (std::size_t i = 0; i < Array::Cast(*(args[0]))->Length(); ++i) {
         Local<Value> v = o->Get(i);
         if (!v->IsObject()) {
@@ -852,7 +866,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
                 "Array elements must be objects containing subscription "
                 "information.")));
         }
-        Local<Object> io = v->ToObject();
+        Local<Object> io = v->ToObject(context).ToLocalChecked();
 
         // Process 'security' string
         Local<Value> iv = io->Get(NEW_STRING("security"));
@@ -873,7 +887,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
                 "Property 'fields' must be an array of strings.")));
         }
         std::string fields;
-        formFields(&fields, iv->ToObject());
+        formFields(context, &fields, iv->ToObject(context).ToLocalChecked());
 
         // Process 'options' array
         iv = io->Get(NEW_STRING("options"));
@@ -884,7 +898,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
                 "options.")));
         }
         std::string options;
-        formOptions(&options, iv);
+        formOptions(context, &options, iv);
 
         // Process 'correlation' int or string
         iv = io->Get(NEW_STRING("correlation"));
@@ -892,7 +906,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
             RetThrowException(Exception::Error(NEW_STRING(
                 "Property 'correlation' must be an integer.")));
         }
-        int correlation = iv->Int32Value();
+        int correlation = iv->Int32Value(context).FromJust();
 
         sl.add(*secv, fields.c_str(), options.c_str(),
                blpapi::CorrelationId(correlation));
@@ -909,7 +923,7 @@ Session::subscribe(const FunctionCallbackInfo<Value>& args, int action)
 
     const blpapi::Identity *identity = session->getIdentity(args, 1);
     if (args.Length() == 3) {
-        Local<String> s = args[2]->ToString();
+        Local<String> s = args[2]->ToString(context).ToLocalChecked();
         String::Utf8Value labelv(s);
         if (action == 1)
             session->d_session->resubscribe(sl, *labelv, labelv.length());
@@ -944,8 +958,10 @@ DEFINE_WRAPPER(Unsubscribe, subscribe, 2)
 void
 Session::Request(const FunctionCallbackInfo<Value>& args)
 {
-    EscapableHandleScope scope(args.GetIsolate());
-
+    Isolate *isolate = args.GetIsolate();
+    EscapableHandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
+    
     if (args.Length() < 1 || !args[0]->IsString()) {
         RetThrowException(Exception::Error(NEW_STRING(
             "Service URI string must be provided as first parameter.")));
@@ -979,7 +995,7 @@ Session::Request(const FunctionCallbackInfo<Value>& args)
             "Function expects at most six arguments.")));
     }
 
-    int cidi = args[3]->Int32Value();
+    int cidi = args[3]->Int32Value(context).FromJust();
 
     Session* session = ObjectWrap::Unwrap<Session>(args.This());
 
@@ -990,17 +1006,17 @@ Session::Request(const FunctionCallbackInfo<Value>& args)
 
     BLPAPI_EXCEPTION_TRY
 
-    Local<String> uri = args[0]->ToString();
+    Local<String> uri = args[0]->ToString(context).ToLocalChecked();
     String::Utf8Value uriv(uri);
 
     blpapi::Service service = session->d_session->getService(*uriv);
 
-    Local<String> name = args[1]->ToString();
+    Local<String> name = args[1]->ToString(context).ToLocalChecked();
     String::Utf8Value namev(name);
 
     blpapi::Request request(service.createRequest(*namev));
     std::string error;
-    if (loadRequest(&request, args[2], &error)) {
+    if (loadRequest(isolate, context, &request, args[2], &error)) {
         RetThrowException(Exception::Error(NEW_STRING(error.c_str())));
     }
 
@@ -1009,7 +1025,7 @@ Session::Request(const FunctionCallbackInfo<Value>& args)
     const blpapi::Identity *identity = session->getIdentity(args, 4);
 
     if (args.Length() == 6) {
-        String::Utf8Value labelv(args[5]->ToString());
+        String::Utf8Value labelv(args[5]->ToString(context).ToLocalChecked());
         session->d_session->sendRequest(request, *identity,
                                         cid, 0, *labelv, labelv.length());
     } else {
@@ -1018,12 +1034,11 @@ Session::Request(const FunctionCallbackInfo<Value>& args)
 
     BLPAPI_EXCEPTION_CATCH_RETURN
 
-    args.GetReturnValue().Set(
-        scope.Escape(Integer::New(args.GetIsolate(), cidi)));
+    args.GetReturnValue().Set(scope.Escape(Integer::New(args.GetIsolate(), cidi)));
 }
 
 Handle<Value>
-Session::elementToValue(Isolate *isolate, const blpapi::Element& e)
+Session::elementToValue(Isolate *isolate, Local<Context> context, const blpapi::Element& e)
 {
     if (e.isComplexType()) {
         int numElements = e.numElements();
@@ -1032,26 +1047,26 @@ Session::elementToValue(Isolate *isolate, const blpapi::Element& e)
             blpapi::Element se = e.getElement(i);
             Handle<Value> sev;
             if (se.isComplexType() || se.isArray()) {
-                sev = elementToValue(isolate, se);
+                sev = elementToValue(isolate, context, se);
             } else {
-                sev = elementValueToValue(isolate, se);
+                sev = elementValueToValue(isolate, context, se);
             }
-            o->ForceSet(String::NewFromUtf8(isolate,
+            o->DefineOwnProperty(context, String::NewFromUtf8(isolate,
                                             se.name().string(),
                                             String::kNormalString,
                                             se.name().length()),
-                   sev, (PropertyAttribute)(ReadOnly | DontDelete));
+                   sev, (PropertyAttribute)(ReadOnly | DontDelete)).FromJust();
         }
         return o;
     } else if (e.isArray()) {
         int numValues = e.numValues();
         Local<Object> o = Array::New(isolate, numValues);
         for (int i = 0; i < numValues; ++i) {
-            o->Set(i, elementValueToValue(isolate, e, i));
+            o->Set(context, i, elementValueToValue(isolate, context, e, i));
         }
         return o;
     } else {
-        return elementValueToValue(isolate, e);
+        return elementValueToValue(isolate, context, e);
     }
 }
 
@@ -1103,6 +1118,7 @@ mkutctime(struct tm* tm)
 
 Handle<Value>
 Session::elementValueToValue(Isolate                *isolate,
+                             Local<Context>          context, 
                              const blpapi::Element&  e,
                              int                     idx)
 {
@@ -1215,7 +1231,7 @@ Session::elementValueToValue(Isolate                *isolate,
         }
         case blpapi::DataType::SEQUENCE:
         case blpapi::DataType::CHOICE:
-            return elementToValue(isolate, e.getValueAsElement(idx));
+            return elementToValue(isolate, context, e.getValueAsElement(idx));
         default:
             break;
     }
@@ -1227,10 +1243,12 @@ Session::elementValueToValue(Isolate                *isolate,
 const blpapi::Identity*
 Session::getIdentity(const FunctionCallbackInfo<Value>& args, int index)
 {
+    Local<Context> context = args.GetIsolate()->GetCurrentContext();
+    
     const blpapi::Identity* identity = &(this->d_identity);
     if (args.Length() > index && args[index]->IsObject()) {
         // If the identity was supplied, use it.
-        Identity* id = ObjectWrap::Unwrap<Identity>(args[index]->ToObject());
+        Identity* id = ObjectWrap::Unwrap<Identity>(args[index]->ToObject(context).ToLocalChecked());
         if (id != NULL) {
             identity = id->getIdentity();
         }
@@ -1267,6 +1285,7 @@ eventTypeToString(Isolate *isolate, blpapi::Event::EventType et)
 
 void
 Session::processMessage(Isolate *isolate,
+                        Local<Context> context,
                         blpapi::Event::EventType et,
                         const blpapi::Message& msg)
 {
@@ -1313,15 +1332,15 @@ Session::processMessage(Isolate *isolate,
                                   messageType.length());
 
     Local<Object> o = Object::New(isolate);
-    o->ForceSet(Local<String>::New(isolate, s_event_type),
-                eventTypeToString(isolate, et),
-                (PropertyAttribute)(ReadOnly | DontDelete));
-    o->ForceSet(Local<String>::New(isolate, s_message_type),
-                argv[0],
-                (PropertyAttribute)(ReadOnly | DontDelete));
-    o->ForceSet(Local<String>::New(isolate, s_topic_name),
-                String::NewFromUtf8(isolate, msg.topicName()),
-                (PropertyAttribute)(ReadOnly | DontDelete));
+    o->DefineOwnProperty(context, Local<String>::New(isolate, s_event_type),
+                         eventTypeToString(isolate, et),
+                         (PropertyAttribute)(ReadOnly | DontDelete)).FromJust();
+    o->DefineOwnProperty(context, Local<String>::New(isolate, s_message_type),
+                         argv[0],
+                         (PropertyAttribute)(ReadOnly | DontDelete)).FromJust();
+    o->DefineOwnProperty(context, Local<String>::New(isolate, s_topic_name),
+                         String::NewFromUtf8(isolate, msg.topicName()),
+                         (PropertyAttribute)(ReadOnly | DontDelete)).FromJust();
 
     Local<Array> correlations = Array::New(isolate, msg.numCorrelationIds());
     for (int i = 0, j = 0; i < msg.numCorrelationIds(); ++i) {
@@ -1341,14 +1360,14 @@ Session::processMessage(Isolate *isolate,
         }
     }
 
-    Local<Object> data = elementToValue(isolate, msg.asElement())->ToObject();
-    o->ForceSet(Local<String>::New(isolate, s_correlations),
-                correlations, (PropertyAttribute)(ReadOnly | DontDelete));
-
-    o->ForceSet(Local<String>::New(isolate, s_data), data);
+    Local<Object> data = elementToValue(isolate, context, msg.asElement())->ToObject(context).ToLocalChecked();
+    
+    o->DefineOwnProperty(context, Local<String>::New(isolate, s_correlations), 
+                         correlations, (PropertyAttribute)(ReadOnly | DontDelete)).FromJust();
+    o->DefineOwnProperty(context, Local<String>::New(isolate, s_data), data).FromJust();
 
     if (!identityObj.IsEmpty()) {
-        data->ForceSet(Local<String>::New(isolate, s_identity), identityObj);
+        data->DefineOwnProperty(context, Local<String>::New(isolate, s_identity), identityObj).FromJust();
     }
 
     argv[1] = o;
@@ -1360,6 +1379,7 @@ void
 Session::processEvents(uv_async_t *async)
 {
     Isolate *isolate = Isolate::GetCurrent();
+    Local<Context> context = isolate->GetCurrentContext();
     HandleScope scope(isolate);
     Session *session = reinterpret_cast<Session *>(async->data);
 
@@ -1391,7 +1411,7 @@ Session::processEvents(uv_async_t *async)
                 // because the `MessageIterator` requires the session
                 // to still exist.
                 session->d_dispatching = true;
-                session->processMessage(isolate, ev.eventType(), msg);
+                session->processMessage(isolate, context, ev.eventType(), msg);
                 session->d_dispatching = false;
                 if (session->d_destroy)
                     break;
@@ -1441,7 +1461,7 @@ Session::emit(Isolate *isolate, int argc, Handle<Value> argv[])
                 handle(isolate)->Get(Local<String>::New(isolate, s_emit)));
     node::MakeCallback(isolate,
                        isolate->GetCurrentContext()->Global(),
-                       emit, argc, argv);
+                       emit, argc, argv, node::async_context{0, 0}).ToLocalChecked();
 }
 
 }   // close namespace blpapijs
