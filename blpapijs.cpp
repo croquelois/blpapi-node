@@ -1379,8 +1379,8 @@ void
 Session::processEvents(uv_async_t *async)
 {
     Isolate *isolate = Isolate::GetCurrent();
-    Local<Context> context = isolate->GetCurrentContext();
     HandleScope scope(isolate);
+    Local<Context> context = isolate->GetCurrentContext();
     Session *session = reinterpret_cast<Session *>(async->data);
 
     bool empty;
